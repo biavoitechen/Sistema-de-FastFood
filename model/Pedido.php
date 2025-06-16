@@ -1,61 +1,152 @@
 <?php
 
+require_once __DIR__ . "/../config/Banco.php";
+
 class Pedido
 {
-    public static function listarProdutos($conn)
-    {
-        $sql = "SELECT * FROM produtos ORDER BY nome ASC";
-        $result = $conn->query($sql);
-        return $result->fetch_all(MYSQLI_ASSOC);
+
+    public static function salvarPedido($itens, $formaPagamento, $idUsuario = null)
+{
+    $banco = Banco::pegarConexao();
+
+    if (!$idUsuario && isset($_SESSION['usuario'])) {
+        $idUsuario = $_SESSION['usuario']->id;
     }
 
-    public static function salvarPedido($conn, $itens, $idUsuario = 1)
-    {
-        $stmt = $conn->prepare("INSERT INTO pedidos (id_usuario, forma_pagamento, status) VALUES (?, 'dinheiro', 'pendente')");
-        $stmt->bind_param("i", $idUsuario);
-        $stmt->execute();
-        $idPedido = $conn->insert_id;
+    $formasValidas = ['dinheiro', 'pix', 'cartao_credito', 'cartao_debito'];
 
-        foreach ($itens as $idProduto) {
-            $produtoStmt = $conn->prepare("SELECT preco FROM produtos WHERE id = ?");
-            $produtoStmt->bind_param("i", $idProduto);
-            $produtoStmt->execute();
-            $produtoResult = $produtoStmt->get_result()->fetch_assoc();
+    if (!in_array($formaPagamento, $formasValidas)) {
+        die('Forma de pagamento inválida.');
+    }
 
-            $preco = $produtoResult['preco'];
-            $quantidade = 1;
+    $queryPedido = "INSERT INTO pedidos (usuario_id, forma_pagamento, status) 
+                    VALUES ($idUsuario, '$formaPagamento', 'pendente')";
+    $banco->query($queryPedido);
 
-            $itemStmt = $conn->prepare("INSERT INTO pedido_itens (id_pedido, id_produto, quantidade, preco_unitario) VALUES (?, ?, ?, ?)");
-            $itemStmt->bind_param("iiid", $idPedido, $idProduto, $quantidade, $preco);
-            $itemStmt->execute();
+    $idPedido = $banco->insert_id;
+
+    foreach ($itens as $item) {
+        if (!is_array($item) || !isset($item['id']) || !isset($item['quantidade'])) {
+            continue;
         }
 
-        return $idPedido;
+        $idProduto = (int)$item['id'];
+        $quantidade = (int)$item['quantidade'];
+
+        $resp = $banco->query("SELECT preco FROM produtos WHERE id = $idProduto");
+
+        if ($resp && $obj = $resp->fetch_object()) {
+            $preco = (float)$obj->preco;
+
+            $queryItem = "INSERT INTO itens_pedido (pedido_id, produto_id, quantidade, preco_unitario) 
+                          VALUES ($idPedido, $idProduto, $quantidade, $preco)";
+            $banco->query($queryItem);
+        }
     }
 
-    public static function listarPedidosPendentes($conn)
-    {
-        $sql = "SELECT * FROM pedidos WHERE status != 'entregue' ORDER BY data_hora ASC";
-        return $conn->query($sql)->fetch_all(MYSQLI_ASSOC);
+    return $idPedido;
+}
+
+    public static function listarPedidosPendentes()
+{
+    $banco = Banco::pegarConexao();
+
+    $res = $banco->query("
+        SELECT id, usuario_id, status, criado_em 
+        FROM pedidos 
+        WHERE status IN ('pendente', 'em_preparo', 'pronto')
+        ORDER BY id DESC
+    ");
+
+    $pedidos = [];
+    while ($p = $res->fetch_object()) {
+        $pedidos[] = $p;
     }
 
-    public static function listarItensDoPedido($conn, $idPedido)
+    return $pedidos;
+}
+
+    public static function listarItensDoPedido($idPedido)
+{
+    $banco = Banco::pegarConexao();
+
+    $idPedido = (int)$idPedido;
+
+    $query = "
+        SELECT p.nome, ip.quantidade, ip.preco_unitario
+        FROM itens_pedido ip
+        JOIN produtos p ON p.id = ip.produto_id
+        WHERE ip.pedido_id = $idPedido
+    ";
+    
+    $resp = $banco->query($query);
+
+    if (!$resp) {
+        return [];
+    }
+
+    $itensDoPedido = [];
+    while ($t = $resp->fetch_object()) {
+        $itensDoPedido[] = $t;
+    }
+
+    return $itensDoPedido;
+}
+
+
+
+    public static function atualizarStatus($idPedido, $novoStatus)
     {
-        $sql = "SELECT p.nome, pi.quantidade, pi.preco_unitario
-                FROM pedido_itens pi
-                JOIN produtos p ON p.id = pi.id_produto
-                WHERE pi.id_pedido = ?";
+        $banco = Banco::pegarConexao();
+        return $banco->query("UPDATE pedidos SET status = $novoStatus WHERE id = $idPedido");
         
-        $stmt = $conn->prepare($sql);
-        $stmt->bind_param("i", $idPedido);
-        $stmt->execute();
-        return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    }
+    
+   public static function buscarPedidosEntreguesPorAtendente($idAtendente)
+{
+    $banco = Banco::pegarConexao();
+    $idAtendente = (int)$idAtendente;
+
+    $query = "
+        SELECT * 
+        FROM pedidos 
+        WHERE atendente_id = $idAtendente AND status = 'entregue' 
+        ORDER BY criado_em DESC
+    ";
+
+    $resultado = $banco->query($query);
+
+    if (!$resultado) {
+        return [];
     }
 
-    public static function atualizarStatus($conn, $idPedido, $novoStatus)
-    {
-        $stmt = $conn->prepare("UPDATE pedidos SET status = ? WHERE id = ?");
-        $stmt->bind_param("si", $novoStatus, $idPedido);
-        return $stmt->execute();
+    $pedidos = [];
+
+    while ($pedido = $resultado->fetch_object()) {
+        $pedido->itens = self::listarItensDoPedido($pedido->id);
+        $pedidos[] = $pedido;
     }
+
+    return $pedidos;
+}
+
+public static function listarPedidosPorCliente($idCliente)
+{
+    $banco = Banco::pegarConexao();
+    $pedidos = [];
+
+    $query = "SELECT * FROM pedidos WHERE usuario_id = $idCliente ORDER BY criado_em DESC";
+    $resp = $banco->query($query);
+
+    while ($pedido = $resp->fetch_object()) {
+        $pedido->itens = self::listarItensDoPedido($pedido->id);
+        $pedidos[] = $pedido;
+    }
+
+    return $pedidos;
+}
+
+    
+
+    
 }
